@@ -96,7 +96,7 @@ class EngineClient(ABC):
         #    this happens again in generation, so the double expansion causes
         #    a mismatch.
         # TODO - would be ideal to handle this more gracefully.
-        prompt_token_ids = prompt.get("prompt_token_ids")
+        prompt_token_ids = processed_inputs["prompt_token_ids"]
         multi_modal_data = prompt.get("multi_modal_data")
 
         prompt_text = processed_inputs.get("prompt")
@@ -110,6 +110,7 @@ class EngineClient(ABC):
         beam_search_params = SamplingParams(
             logprobs=2 * beam_width,
             max_tokens=1,
+            repetition_penalty=1.1,
             temperature=temperature,
         )
         all_beams = [
