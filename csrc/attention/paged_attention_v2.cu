@@ -156,6 +156,9 @@ void paged_attention_v2_launcher(
 // 1, 2, 4, 64, 128, 256.
 #define CALL_V2_LAUNCHER_BLOCK_SIZE(T, CACHE_T, KV_DTYPE)         \
   switch (block_size) {                                           \
+    case 2:                                                       \
+      CALL_V2_LAUNCHER_SPARSITY(T, CACHE_T, 2, KV_DTYPE);         \
+      break;                                                      \
     case 8:                                                       \
       CALL_V2_LAUNCHER_SPARSITY(T, CACHE_T, 8, KV_DTYPE);         \
       break;                                                      \
