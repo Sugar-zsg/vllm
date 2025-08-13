@@ -94,7 +94,7 @@ class EngineClient(ABC):
         #    this happens again in generation, so the double expansion causes
         #    a mismatch.
         # TODO - would be ideal to handle this more gracefully.
-        prompt_token_ids = prompt.get("prompt_token_ids")
+        processed_inputs["prompt_token_ids"] 
         multi_modal_data = prompt.get("multi_modal_data")
 
         prompt_text = processed_inputs.get("prompt")
@@ -166,22 +166,26 @@ class EngineClient(ABC):
                                     logprob_obj.logprob,
                                     finish_reason="stop",
                                     stop_reason=tokenizer.eos_token_id))
-                        else:
-                            new_beams.append(
-                                BeamSearchSequence(
-                                    tokens=current_beam.tokens + [token_id],
-                                    logprobs=current_beam.logprobs +
-                                    [logprobs],
-                                    lora_request=current_beam.lora_request,
-                                    cum_logprob=current_beam.cum_logprob +
-                                    logprob_obj.logprob,
-                                    multi_modal_data=current_beam.
-                                    multi_modal_data,
-                                    mm_processor_kwargs=current_beam.
-                                    mm_processor_kwargs))
+                        new_beams.append(
+                            BeamSearchSequence(
+                                tokens=current_beam.tokens + [token_id],
+                                logprobs=current_beam.logprobs +
+                                [logprobs],
+                                lora_request=current_beam.lora_request,
+                                cum_logprob=current_beam.cum_logprob +
+                                logprob_obj.logprob,
+                                multi_modal_data=current_beam.
+                                multi_modal_data,
+                                mm_processor_kwargs=current_beam.
+                                mm_processor_kwargs))
 
             sorted_beams = sorted(new_beams, key=sort_beams_key, reverse=True)
-            all_beams = sorted_beams[:beam_width]
+            all_beams = [
+                beam for beam in sorted_beams[:beam_width]
+                if beam.tokens and beam.tokens[-1] != tokenizer.eos_token_id
+            ]
+            if not all_beams:
+                break
 
         completed.extend(all_beams)
         sorted_completed = sorted(completed, key=sort_beams_key, reverse=True)
