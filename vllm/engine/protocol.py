@@ -19,6 +19,7 @@ from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.utils import Device, collect_from_async_generator, random_uuid
+from vllm.engine.encoder_cache import EncoderCache
 
 logger = init_logger(__name__)
 
@@ -48,23 +49,23 @@ class EngineClient(ABC):
 
     @abstractmethod
     def generate(
-        self,
-        prompt: PromptType,
-        sampling_params: SamplingParams,
-        request_id: str,
-        lora_request: Optional[LoRARequest] = None,
-        trace_headers: Optional[Mapping[str, str]] = None,
-        priority: int = 0,
+            self,
+            prompt: PromptType,
+            sampling_params: SamplingParams,
+            request_id: str,
+            lora_request: Optional[LoRARequest] = None,
+            trace_headers: Optional[Mapping[str, str]] = None,
+            priority: int = 0,
     ) -> AsyncGenerator[RequestOutput, None]:
         """Generate outputs for a request."""
         ...
 
     async def beam_search(
-        self,
-        prompt: PromptType,
-        request_id: str,
-        params: BeamSearchParams,
-        lora_request: Optional[LoRARequest] = None,
+            self,
+            prompt: PromptType,
+            request_id: str,
+            params: BeamSearchParams,
+            lora_request: Optional[LoRARequest] = None,
     ) -> AsyncGenerator[RequestOutput, None]:
 
         beam_width = params.beam_width
@@ -94,11 +95,15 @@ class EngineClient(ABC):
         #    this happens again in generation, so the double expansion causes
         #    a mismatch.
         # TODO - would be ideal to handle this more gracefully.
-        prompt_token_ids = prompt.get("prompt_token_ids")
+        prompt_token_ids = processed_inputs["prompt_token_ids"]
         multi_modal_data = prompt.get("multi_modal_data")
 
         prompt_text = processed_inputs.get("prompt")
         mm_processor_kwargs = processed_inputs.get("mm_processor_kwargs")
+        #        vllm_config = await self.get_vllm_config()
+        #        prefix = ""
+        #        whisper_encoder = WhisperEncoder(vllm_config = vllm_config,
+        #                                         prefix=f"{prefix}.encoder")
 
         tokenized_length = len(prompt_token_ids)
 
@@ -119,6 +124,13 @@ class EngineClient(ABC):
                                lora_request=lora_request)
         ]
         completed = []
+        encoder_cache = EncoderCache()
+        encoder_cache.release_encoder_output()
+
+        #        encoder_outputs = whisper_encoder()
+        #        encoder_input = self.prepare_vllm_whisper_inputs(multi_modal_data)
+        #        print(f"encoder_input shape : {encoder_input.shape}")
+        #        print(f"encoder_input: {encoder_input}")
 
         for _ in range(max_tokens):
             prompts_batch, lora_req_batch = zip(*[(
@@ -154,34 +166,40 @@ class EngineClient(ABC):
                     logprobs = result.outputs[0].logprobs[0]
                     for token_id, logprob_obj in logprobs.items():
                         if token_id == tokenizer.eos_token_id and \
-                            not ignore_eos:
+                                not ignore_eos:
                             completed.append(
                                 BeamSearchSequence(
                                     tokens=current_beam.tokens +
-                                    [token_id] if include_stop_str_in_output
+                                           [token_id] if include_stop_str_in_output
                                     else current_beam.tokens,
                                     logprobs=current_beam.logprobs +
-                                    [logprobs],
+                                             [logprobs],
                                     cum_logprob=current_beam.cum_logprob +
-                                    logprob_obj.logprob,
+                                                logprob_obj.logprob,
                                     finish_reason="stop",
                                     stop_reason=tokenizer.eos_token_id))
-                        else:
-                            new_beams.append(
-                                BeamSearchSequence(
-                                    tokens=current_beam.tokens + [token_id],
-                                    logprobs=current_beam.logprobs +
-                                    [logprobs],
-                                    lora_request=current_beam.lora_request,
-                                    cum_logprob=current_beam.cum_logprob +
-                                    logprob_obj.logprob,
-                                    multi_modal_data=current_beam.
-                                    multi_modal_data,
-                                    mm_processor_kwargs=current_beam.
-                                    mm_processor_kwargs))
+
+                        new_beams.append(
+                            BeamSearchSequence(
+                                tokens=current_beam.tokens + [token_id],
+                                logprobs=current_beam.logprobs +
+                                         [logprobs],
+                                lora_request=current_beam.lora_request,
+                                cum_logprob=current_beam.cum_logprob +
+                                            logprob_obj.logprob,
+                                multi_modal_data=current_beam.
+                                multi_modal_data,
+                                mm_processor_kwargs=current_beam.
+                                mm_processor_kwargs))
 
             sorted_beams = sorted(new_beams, key=sort_beams_key, reverse=True)
-            all_beams = sorted_beams[:beam_width]
+            all_beams = [
+                beam for beam in sorted_beams[:beam_width]
+                if beam.tokens and beam.tokens[-1] != tokenizer.eos_token_id
+            ]
+            if not all_beams:
+                break
+        encoder_cache.release_encoder_output()
 
         completed.extend(all_beams)
         sorted_completed = sorted(completed, key=sort_beams_key, reverse=True)
@@ -217,13 +235,13 @@ class EngineClient(ABC):
 
     @abstractmethod
     def encode(
-        self,
-        prompt: PromptType,
-        pooling_params: PoolingParams,
-        request_id: str,
-        lora_request: Optional[LoRARequest] = None,
-        trace_headers: Optional[Mapping[str, str]] = None,
-        priority: int = 0,
+            self,
+            prompt: PromptType,
+            pooling_params: PoolingParams,
+            request_id: str,
+            lora_request: Optional[LoRARequest] = None,
+            trace_headers: Optional[Mapping[str, str]] = None,
+            priority: int = 0,
     ) -> AsyncGenerator[PoolingRequestOutput, None]:
         """Generate outputs for a request from a pooling model."""
         ...
@@ -260,8 +278,8 @@ class EngineClient(ABC):
 
     @abstractmethod
     async def get_tokenizer(
-        self,
-        lora_request: Optional[LoRARequest] = None,
+            self,
+            lora_request: Optional[LoRARequest] = None,
     ) -> AnyTokenizer:
         """Get the appropriate tokenizer for the request"""
         ...
@@ -272,9 +290,9 @@ class EngineClient(ABC):
 
     @abstractmethod
     async def do_log_stats(
-        self,
-        scheduler_outputs: Optional[SchedulerOutputs] = None,
-        model_output: Optional[list[SamplerOutput]] = None,
+            self,
+            scheduler_outputs: Optional[SchedulerOutputs] = None,
+            model_output: Optional[list[SamplerOutput]] = None,
     ) -> None:
         ...
 
@@ -328,12 +346,4 @@ class EngineClient(ABC):
                                new_data_parallel_size: int,
                                drain_timeout: int = 300) -> None:
         """Scale the engine"""
-        raise NotImplementedError
-
-    async def collective_rpc(self,
-                             method: str,
-                             timeout: Optional[float] = None,
-                             args: tuple = (),
-                             kwargs: Optional[dict] = None):
-        """Perform a collective RPC call to the given path."""
         raise NotImplementedError

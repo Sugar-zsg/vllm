@@ -5,6 +5,7 @@ import math
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import nullcontext
 from typing import Optional, TypedDict, Union, cast
+from vllm.engine.encoder_cache import EncoderCache
 
 import numpy as np
 import torch
@@ -33,7 +34,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.multimodal import MULTIMODAL_REGISTRY, NestedTensors
 from vllm.multimodal.inputs import (MultiModalDataDict, MultiModalFieldConfig,
-                                    MultiModalKwargsItems)
+                                    MultiModalKwargs)
 from vllm.multimodal.parse import MultiModalDataItems, MultiModalDataParser
 from vllm.multimodal.processing import (BaseProcessingInfo,
                                         EncDecMultiModalProcessor,
@@ -553,6 +554,7 @@ class WhisperModel(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        self.encoder_cache = EncoderCache()
         self.encoder = WhisperEncoder(vllm_config=vllm_config,
                                       prefix=f"{prefix}.encoder")
         self.decoder = WhisperDecoder(vllm_config=vllm_config,
@@ -564,6 +566,8 @@ class WhisperModel(nn.Module):
         input_ids: Optional[torch.Tensor],
         positions: torch.Tensor,
     ) -> torch.Tensor:
+        import time
+        encoder_time = time.time()
         encoder_outputs = self.get_encoder_outputs(input_features)
         decoder_outputs = self.decoder(
             input_ids=input_ids,
@@ -578,7 +582,13 @@ class WhisperModel(nn.Module):
     ) -> Optional[torch.Tensor]:
         if input_features is None:
             return None
-        return self.encoder(input_features)
+        pre_encoder_output = self.encoder_cache.get_encoder_output()
+        if pre_encoder_output == None:
+            encoder_output = self.encoder(input_features)
+            self.encoder_cache.set_encoder_output(encoder_output)
+            return encoder_output
+        else :
+            return pre_encoder_output
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
@@ -728,7 +738,7 @@ class WhisperMultiModalProcessor(
         self,
         mm_items: MultiModalDataItems,
         hf_processor_mm_kwargs: Mapping[str, object],
-        out_mm_kwargs: MultiModalKwargsItems,
+        out_mm_kwargs: MultiModalKwargs,
     ) -> Sequence[PromptUpdate]:
         num_tokens = self.info.get_num_audio_tokens()
         return [
