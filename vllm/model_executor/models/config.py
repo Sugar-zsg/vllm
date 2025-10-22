@@ -510,4 +510,40 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "Mamba2ForCausalLM": MambaModelConfig,
     "FalconMambaForCausalLM": MambaModelConfig,
     "DeepseekV32ForCausalLM": DeepseekV32ForCausalLM,
+    # Custom AED model: map minimal fields for attention backends.
+    # Ensures hf_text_config exposes num_attention_heads, hidden_size, etc.
+    "FireRedAEDForConditionalGeneration": type(
+        "FireRedAEDModelConfig",
+        (VerifyAndUpdateConfig,),
+        {
+            "verify_and_update_config": staticmethod(
+                lambda vllm_config: _verify_update_firered_aed(vllm_config)
+            ),
+        },
+    ),
+
 }
+
+
+def _verify_update_firered_aed(vllm_config: "VllmConfig") -> None:
+    cfg = vllm_config.model_config.hf_config
+    text_cfg = vllm_config.model_config.hf_text_config
+    # Map common AED fields to what vLLM attention expects
+    # hidden_size / d_model
+    if getattr(text_cfg, "hidden_size", None) is None:
+        setattr(text_cfg, "hidden_size", getattr(cfg, "d_model", None))
+    # num_attention_heads / n_head
+    if getattr(text_cfg, "num_attention_heads", None) is None:
+        setattr(text_cfg, "num_attention_heads", getattr(cfg, "n_head", None))
+    # is_encoder_decoder: make sure vLLM recognizes encoder-decoder pipeline
+    if getattr(text_cfg, "is_encoder_decoder", None) is None:
+        setattr(text_cfg, "is_encoder_decoder", True)
+    # decoder_start_token_id / bos/eos sanity
+    for attr in ("decoder_start_token_id", "bos_token_id", "eos_token_id"):
+        if getattr(text_cfg, attr, None) is None and hasattr(cfg, attr):
+            setattr(text_cfg, attr, getattr(cfg, attr))
+    # group kv heads if present (optional)
+    for attr in ("n_head_kv", "num_kv_heads", "num_key_value_heads", "multi_query_group_num"):
+        if getattr(text_cfg, attr, None) is None and hasattr(cfg, attr):
+            setattr(text_cfg, attr, getattr(cfg, attr))
+    # attention_chunk_size not used by AED; ensure absent/default is fine.

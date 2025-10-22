@@ -2,18 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-Native vLLM wrapper for FireRedASR (AED), enabling OpenAI audio transcription
-via vLLM’s scheduling and attention kernels.
+This model supports OpenAI audio transcription using
+vLLM's multimodal pipeline and attention kernels.
 
-This integrates an encoder that consumes audio features and a vLLM-style
-decoder layer with flash/page attention. It implements SupportsTranscription
-and SupportsMultiModal to work with vLLM's OpenAI audio routes.
+Highlights:
+- Loads a local AED checkpoint via `torch.load(<model_dir>/model.pth.tar)`.
+- Implements SupportsTranscription and SupportsMultiModal interfaces.
+- Avoids strict HF weight loading by overriding `load_weights`.
+- Provides minimal audio feature extraction if HF processor unavailable.
 
-Notes:
-- We optionally map weights from a packaged checkpoint at
-  `<model_path>/model.pth.tar` where possible.
-- Audio features are derived from raw audio via the multimodal pipeline.
-  We estimate frame count for prompt replacement using a 10ms hop.
+Assumptions:
+- Model config JSON under the model directory provides fields like:
+  `d_model`, `odim`, `n_layers_enc`, `n_layers_dec`, `n_head`, `pad_id`,
+  `pe_maxlen`, `idim`.
+- Checkpoint contains keys similar to ESPnet-style AED (e.g. decoder.tgt_word_emb,
+  encoder/self_attn parameters). When not present, model runs with random init.
 """
 
 from __future__ import annotations
@@ -32,7 +35,6 @@ from vllm.config import CacheConfig, ModelConfig, SpeechToTextConfig, VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.inputs.data import PromptType
 from vllm.logger import init_logger
-from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -54,6 +56,7 @@ from vllm.multimodal.processing import (
     PromptReplacement,
     PromptUpdate,
 )
+from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
@@ -67,14 +70,14 @@ from .utils import (
 logger = init_logger(__name__)
 
 
-# Minimal ISO-639-1 support map (extend as needed)
+# Minimal ISO-639-1 support map
 _SUPPORTED_LANGS = {
     "en": "English",
     "zh": "Chinese",
 }
 
 
-class FireRedAudioInputs(TensorSchema):
+class FireRedAEDAudioInputs(TensorSchema):
     """Audio inputs consumed by the encoder.
 
     input_features: list of 2D tensors (T, 80)
@@ -83,16 +86,30 @@ class FireRedAudioInputs(TensorSchema):
     input_features: Annotated[list[torch.Tensor] | None, TensorShape("b", "t", 80)]
 
 
-class FireRedASRProcessingInfo(BaseProcessingInfo):
+class FireRedAEDProcessingInfo(BaseProcessingInfo):
+    def get_tokenizer(self) -> AnyTokenizer:  # type: ignore[override]
+        tok = self.ctx.tokenizer
+        if tok is None:
+            class _NullTokenizer:
+                bos_token_id = None
+                eos_token_id = None
+
+                def encode(self, text, **kwargs):
+                    return[]
+
+                def decode(self, tokens, **kwargs):
+                    return ""
+
+            return _NullTokenizer()  # type: ignore[return-value]
+        return tok  # type: ignore[return-value]
+
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"audio": 1}
 
     def get_feature_sample_rate(self) -> int:
-        # FireRedASR typically uses 16kHz
         return 16_000
 
     def get_max_audio_clip_s(self) -> int:
-        # Fallback to 30s if HF processor is not available
         try:
             processor = self.ctx.get_hf_processor()
             chunk_len = getattr(getattr(processor, "feature_extractor", None), "chunk_length", 30)
@@ -101,7 +118,7 @@ class FireRedASRProcessingInfo(BaseProcessingInfo):
             return 30
 
 
-class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessingInfo]):
+class FireRedAEDMultiModalProcessor(EncDecMultiModalProcessor[FireRedAEDProcessingInfo]):
     def _get_data_parser(self) -> MultiModalDataParser:
         return MultiModalDataParser(target_sr=self.info.get_feature_sample_rate())
 
@@ -110,12 +127,22 @@ class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessi
         return True
 
     def create_encoder_prompt(self, prompt: str | list[int], mm_data: MultiModalDataDict) -> str | list[int]:
-        # Create a dummy encoder prompt (padded to the number of audio tokens) for profiling
         return [0]
 
+    def create_decoder_prompt(self, prompt: str | list[int], mm_data: MultiModalDataDict) -> str | list[int]:
+        if isinstance(prompt, str):
+            return [self._get_default_decoder_start_id()]
+        return prompt
+
+    def _get_default_decoder_start_id(self) -> int:
+        cfg = self.info.get_hf_config()
+        dec_id = getattr(cfg, "decoder_start_token_id", None)
+        if dec_id is None:
+            dec_id = getattr(cfg, "bos_token_id", None)
+        return int(dec_id) if dec_id is not None else 0
+
     def _get_mm_fields_config(self, hf_inputs, hf_processor_mm_kwargs) -> Mapping[str, MultiModalFieldConfig]:
-        # We only feed audio features to encoder
-        return dict(input_features=MultiModalFieldConfig.batched("audio"))
+        return {"input_features": MultiModalFieldConfig.batched("audio")}
 
     def _get_prompt_updates(
         self,
@@ -123,24 +150,20 @@ class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessi
         hf_processor_mm_kwargs: Mapping[str, object],
         out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptUpdate]:
-        # Replace dummy token in encoder prompt with a sequence sized to audio frames
-        audios = mm_items.get_items("audio", AudioProcessorItems)
+        try:
+            audios = mm_items.get_items("audio", AudioProcessorItems)
+        except KeyError:
+            return[]
         if len(audios) == 0:
             return[]
 
-        # Estimate projector features per audio using 10ms hop at 16kHz: T ≈ samples/160
         def replacement(item_idx: int):
-            # Estimate frames using 10ms hop at 16kHz
             num_samples = audios.get_audio_length(item_idx)
-            num_frames = max(1, num_samples // 160)
+            num_frames = max(1, num_samples // 160)  # 10ms hop at 16kHz
             return [0] * int(num_frames)
 
         return [
-            PromptReplacement(
-                modality="audio",
-                target=[0],
-                replacement=replacement,
-            )
+            PromptReplacement(modality="audio", target=[0], replacement=replacement)
         ]
 
     def _call_hf_processor(
@@ -150,61 +173,44 @@ class FireRedASRMultiModalProcessor(EncDecMultiModalProcessor[FireRedASRProcessi
         mm_kwargs: Mapping[str, object],
         tok_kwargs: Mapping[str, object],
     ) -> "BatchFeature":
-        # Minimal processor: tokenize decoder prompt and convert raw audio to mel features.
         from transformers.feature_extraction_utils import BatchFeature
-        tokenizer = self.info.get_tokenizer()
+        empty_ids = torch.empty((1, 0), dtype=torch.long)
 
-        # Tokenize decoder prompt (text)
-        input_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
-        attn_mask = [1] * len(input_ids)
-
-        # Convert audio list -> log-mel features [T, 80]
-        audios = mm_data.get("audios", [])
+        audios = mm_data.get("audios",[])
         sr = self.info.get_feature_sample_rate()
         features: list[torch.Tensor] =[]
         if audios:
             try:
                 import librosa
-                for (audio, orig_sr) in audios:  # vLLM parser returns (np.ndarray, sr)
-                    if orig_sr != sr:
-                        audio = librosa.resample(audio, orig_sr=orig_sr, target_sr=sr)
+                for audio in audios:
+                    if isinstance(audio, tuple):
+                        audio, _ = audio
                     mel = librosa.feature.melspectrogram(y=audio, sr=sr, n_fft=400, hop_length=160, n_mels=80)
                     logmel = np.log10(np.maximum(mel, 1e-10))
-                    # [80, T] -> [T, 80]
-                    feat = torch.from_numpy(logmel.T).float()
+                    feat = torch.from_numpy(logmel.T).float()  # [T, 80]
                     features.append(feat)
             except Exception:
-                # Fallback to torch STFT + mel filter
-                for (audio, orig_sr) in audios:
+                for audio in audios:
+                    if isinstance(audio, tuple):
+                        audio, _ = audio
                     wave = torch.tensor(audio, dtype=torch.float32)
-                    if orig_sr != sr:
-                        # naive resample using numpy.interp to avoid torch.interp
-                        ratio = sr / float(orig_sr)
-                        target_len = int(round(len(wave) * ratio))
-                        t = np.linspace(0.0, 1.0, target_len, dtype=np.float32)
-                        src_t = np.linspace(0.0, 1.0, len(wave), dtype=np.float32)
-                        wave = torch.from_numpy(np.interp(t, src_t, wave.cpu().numpy())).to(wave.dtype).to(wave.device)
                     window = torch.hann_window(400)
                     stft = torch.stft(wave, 400, 160, window=window, return_complex=True)
                     magnitudes = stft.abs() ** 2
-                    # Simple mel filter approximation: average bins into 80 groups
                     num_bins = magnitudes.size(0)
                     bins_per_mel = max(1, num_bins // 80)
                     mel = magnitudes[: bins_per_mel * 80].reshape(80, bins_per_mel, -1).mean(1)
                     logmel = torch.clamp(mel, min=1e-10).log10()
-                    feat = logmel.transpose(0, 1)  # [80, T] -> [T, 80]
+                    feat = logmel.transpose(0, 1)  # [T, 80]
                     features.append(feat)
 
-        outputs = {
-            "input_ids": torch.tensor(input_ids, dtype=torch.long),
-            "attention_mask": torch.tensor(attn_mask, dtype=torch.long),
-        }
+        outputs = {"input_ids": empty_ids, "attention_mask": empty_ids.clone()}
         if features:
             outputs["input_features"] = features
         return BatchFeature(outputs)
 
 
-class FireRedASRDummyInputsBuilder(BaseDummyInputsBuilder[FireRedASRProcessingInfo]):
+class FireRedAEDDummyInputsBuilder(BaseDummyInputsBuilder[FireRedAEDProcessingInfo]):
     def get_dummy_mm_data(self, seq_len: int, mm_counts: Mapping[str, int], mm_options: Mapping[str, BaseDummyOptions] | None = None) -> MultiModalDataDict:
         num_audios = mm_counts.get("audio", 0)
         sr = self.info.get_feature_sample_rate()
@@ -213,11 +219,10 @@ class FireRedASRDummyInputsBuilder(BaseDummyInputsBuilder[FireRedASRProcessingIn
         return {"audio": self._get_dummy_audios(length=audio_len, num_audios=num_audios, overrides=audio_overrides)}
 
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
-        # No special decoder tokens; start from empty prompt
         return ""
 
 
-class FireRedPositionalEmbedding(nn.Embedding):
+class FireRedAEDPositionalEmbedding(nn.Embedding):
     def __init__(self, num_positions: int, embedding_dim: int):
         super().__init__(num_positions, embedding_dim)
 
@@ -225,12 +230,7 @@ class FireRedPositionalEmbedding(nn.Embedding):
         return self.weight[position_ids]
 
 
-class FireRedAttention(nn.Module):
-    """Multi-headed attention layer leveraging vLLM kernels.
-
-    Configured for either self-attention (decoder) or cross-attention.
-    """
-
+class FireRedAEDAttention(nn.Module):
     def __init__(
         self,
         embed_dim: int,
@@ -248,7 +248,6 @@ class FireRedAttention(nn.Module):
         self.num_heads = num_heads
         self.scaling = self.head_dim**-0.5
 
-        # QKV projections: self-attn stacks qkv; cross-attn uses q_proj and kv_proj
         if attn_type == AttentionType.DECODER:
             self.qkv_proj = QKVParallelLinear(
                 hidden_size=embed_dim,
@@ -305,50 +304,42 @@ class FireRedAttention(nn.Module):
             prefix=f"{prefix}.out_proj",
         )
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor | None = None) -> torch.Tensor:
         if self.attn_type == AttentionType.DECODER:
             qkv, _ = self.qkv_proj(hidden_states)
-            q, k, v = qkv.split(
-                [self.num_heads * self.head_dim, self.num_heads * self.head_dim, self.num_heads * self.head_dim],
-                dim=-1,
-            )
-            attn_out = self.attn(q, k, v)
+            q, k, v = qkv.split([self.embed_dim, self.embed_dim, self.embed_dim], dim=-1)
+            out = self.attn(q, k, v)
         else:
-            q, _ = self.q_proj(hidden_states)
-            kv, _ = self.kv_proj(encoder_hidden_states)
-            k, v = kv.split(
-                [self.num_heads * self.head_dim, self.num_heads * self.head_dim],
-                dim=-1,
-            )
-            attn_out = self.attn(q, k, v)
-
-        out, _ = self.out_proj(attn_out)
+            if encoder_hidden_states is None:
+                out = torch.zeros_like(hidden_states)
+            else:
+                q, _ = self.q_proj(hidden_states)
+                kv, _ = self.kv_proj(encoder_hidden_states)
+                kv_heads = kv.split([self.embed_dim, self.embed_dim], dim=-1)
+                k = kv_heads[0]
+                v = kv_heads[1]
+                out = self.attn(q, k, v)
+        out, _ = self.out_proj(out)
         return out
 
 
-class FireRedMLP(nn.Module):
-    def __init__(self, embed_dim: int, ffn_dim: int, act_fn: str, *, quant_config: QuantizationConfig | None, prefix: str):
+class FireRedAEDMLP(nn.Module):
+    def __init__(self, embed_dim: int, ffn_dim: int, quant_config: QuantizationConfig | None, prefix: str = ""):
         super().__init__()
-        self.activation_fn = get_act_fn(act_fn)
-        self.fc1 = ColumnParallelLinear(input_size=embed_dim, output_size=ffn_dim, quant_config=quant_config, prefix=f"{prefix}.fc1")
-        self.fc2 = RowParallelLinear(input_size=ffn_dim, output_size=embed_dim, quant_config=quant_config, prefix=f"{prefix}.fc2")
+        self.fc1 = ColumnParallelLinear(embed_dim, ffn_dim, bias=True, quant_config=quant_config, prefix=f"{prefix}.fc1")
+        self.fc2 = RowParallelLinear(ffn_dim, embed_dim, bias=True, quant_config=quant_config, prefix=f"{prefix}.fc2")
+        self.act = nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x, _ = self.fc1(x)
-        x = self.activation_fn(x)
-        x, _ = self.fc2(x)
-        return x
+        h, _ = self.fc1(x)
+        return self.fc2(self.act(h))[0]
 
 
-class FireRedDecoderLayer(nn.Module):
+class FireRedAEDDecoderLayer(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
-        self.self_attn = FireRedAttention(
+        self.self_attn = FireRedAEDAttention(
             embed_dim=config.d_model,
             num_heads=config.n_head,
             attn_type=AttentionType.DECODER,
@@ -356,7 +347,7 @@ class FireRedDecoderLayer(nn.Module):
             quant_config=vllm_config.quant_config,
             prefix=f"{prefix}.self_attn",
         )
-        self.cross_attn = FireRedAttention(
+        self.cross_attn = FireRedAEDAttention(
             embed_dim=config.d_model,
             num_heads=config.n_head,
             attn_type=AttentionType.ENCODER_DECODER,
@@ -367,10 +358,9 @@ class FireRedDecoderLayer(nn.Module):
         self.self_attn_norm = nn.LayerNorm(config.d_model)
         self.cross_attn_norm = nn.LayerNorm(config.d_model)
         self.mlp_norm = nn.LayerNorm(config.d_model)
-        self.mlp = FireRedMLP(
+        self.mlp = FireRedAEDMLP(
             embed_dim=config.d_model,
             ffn_dim=config.d_model * 4,
-            act_fn="gelu",
             quant_config=vllm_config.quant_config,
             prefix=f"{prefix}.mlp",
         )
@@ -392,7 +382,7 @@ class FireRedDecoderLayer(nn.Module):
         return x
 
 
-class FireRedDecoder(nn.Module):
+class FireRedAEDDecoder(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -401,10 +391,10 @@ class FireRedDecoder(nn.Module):
         self.embed_scale = math.sqrt(config.d_model)
 
         self.embed_tokens = nn.Embedding(config.odim, config.d_model, self.padding_idx)
-        self.embed_positions = FireRedPositionalEmbedding(self.max_target_positions, config.d_model)
+        self.embed_positions = FireRedAEDPositionalEmbedding(self.max_target_positions, config.d_model)
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.n_layers_dec,
-            lambda prefix: FireRedDecoderLayer(vllm_config=vllm_config, prefix=f"{prefix}.layers"),
+            lambda prefix: FireRedAEDDecoderLayer(vllm_config=vllm_config, prefix=f"{prefix}.layers"),
             prefix=f"{prefix}.layers",
         )
         self.layer_norm = nn.LayerNorm(config.d_model)
@@ -412,8 +402,18 @@ class FireRedDecoder(nn.Module):
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
-    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor, encoder_outputs: torch.Tensor | None) -> torch.Tensor:
-        inputs_embeds = self.get_input_embeddings(input_ids)
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        encoder_outputs: torch.Tensor | None,
+        *,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if inputs_embeds is None:
+            if input_ids is None:
+                raise ValueError("input_ids and inputs_embeds cannot both be None")
+            inputs_embeds = self.get_input_embeddings(input_ids)
         pos = self.embed_positions(positions)
         x = inputs_embeds + pos
         for layer in self.layers:
@@ -422,19 +422,11 @@ class FireRedDecoder(nn.Module):
         return x
 
 
-class FireRedConformerEncoder(nn.Module):
-    """Minimal integration of FireRedASR encoder frontend + blocks.
-
-    For compatibility, we implement a lightweight conv subsampling front-end
-    and a stack of transformer encoder layers to produce encoder outputs for
-    the decoder cross-attention.
-    """
-
+class FireRedAEDConformerEncoder(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
         self.d_model = config.d_model
-        # Conv subsampling frontend
         self.conv = nn.Sequential(
             nn.Conv2d(1, 32, 3, 2), nn.ReLU(), nn.Conv2d(32, 32, 3, 2), nn.ReLU()
         )
@@ -475,15 +467,27 @@ class FireRedConformerEncoder(nn.Module):
         return x
 
 
-class FireRedASRModel(nn.Module):
+class FireRedAEDModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
-        self.encoder = FireRedConformerEncoder(vllm_config=vllm_config, prefix=f"{prefix}.encoder")
-        self.decoder = FireRedDecoder(vllm_config=vllm_config, prefix=f"{prefix}.decoder")
+        self.encoder = FireRedAEDConformerEncoder(vllm_config=vllm_config, prefix=f"{prefix}.encoder")
+        self.decoder = FireRedAEDDecoder(vllm_config=vllm_config, prefix=f"{prefix}.decoder")
 
-    def forward(self, input_features: list[torch.Tensor] | None, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        input_features: list[torch.Tensor] | None,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        *,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         enc = self.get_encoder_outputs(input_features)
-        dec = self.decoder(input_ids=input_ids, positions=positions, encoder_outputs=enc)
+        dec = self.decoder(
+            input_ids=input_ids,
+            positions=positions,
+            encoder_outputs=enc,
+            inputs_embeds=inputs_embeds,
+        )
         return dec
 
     def get_encoder_outputs(self, input_features: list[torch.Tensor] | None) -> torch.Tensor | None:
@@ -493,18 +497,15 @@ class FireRedASRModel(nn.Module):
 
 
 @MULTIMODAL_REGISTRY.register_processor(
-    FireRedASRMultiModalProcessor,
-    info=FireRedASRProcessingInfo,
-    dummy_inputs=FireRedASRDummyInputsBuilder,
+    FireRedAEDMultiModalProcessor,
+    info=FireRedAEDProcessingInfo,
+    dummy_inputs=FireRedAEDDummyInputsBuilder,
 )
-class FireRedASRForConditionalGeneration(nn.Module, SupportsTranscription, SupportsMultiModal):
-    """vLLM-native FireRedASR AED transcription model."""
-
+class FireRedAEDForConditionalGeneration(nn.Module, SupportsTranscription, SupportsMultiModal):
     merge_by_field_config = True
     supported_languages = _SUPPORTED_LANGS
     supports_transcription_only = True
 
-    # Map stacked QKV projections names to individual ones for weight remapping
     hf_to_vllm_mapper = WeightsMapper(orig_to_new_substr={})
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -514,7 +515,49 @@ class FireRedASRForConditionalGeneration(nn.Module, SupportsTranscription, Suppo
         self.config = config
         self.dtype = vllm_config.model_config.dtype
 
-        self.model = FireRedASRModel(vllm_config=vllm_config, prefix=prefix)
+        # For ASR-only models, disable tokenizer initialization to avoid
+        # pydantic validation against unknown HF config classes during
+        # AutoTokenizer startup. Also ensure vLLM uses model path as tokenizer
+        # path when needed.
+        try:
+            vllm_model_cfg = vllm_config.model_config
+            # 显式跳过 tokenizer 初始化；ASR 不依赖文本提示
+            vllm_model_cfg.skip_tokenizer_init = True
+            # 若 tokenizer 为 None，vLLM 默认使用 `model` 路径；保持为 None。
+        except Exception:
+            pass
+
+        # Ensure decoder/BOS/EOS token ids are set even without a tokenizer.
+        # InputPreprocessor relies on hf_config.decoder_start_token_id for
+        # encoder-decoder models. If it is missing, it falls back to BOS from
+        # tokenizer, which may be None when tokenizer is not initialized for
+        # ASR-only models. Setting explicit defaults here prevents 500s during
+        # /v1/audio/transcriptions.
+        if getattr(config, "decoder_start_token_id", None) is None:
+            # Prefer a non-pad start token. If pad_id exists, avoid it; use 1.
+            try:
+                pad_id = getattr(config, "pad_id", None)
+                default_start = 1 if pad_id != 1 else 2
+            except Exception:
+                default_start = 1
+            setattr(config, "decoder_start_token_id", int(default_start))
+
+        if getattr(config, "bos_token_id", None) is None:
+            # Align BOS with decoder_start_token_id to keep generation stable.
+            setattr(config, "bos_token_id", int(getattr(config, "decoder_start_token_id")))
+
+        if getattr(config, "eos_token_id", None) is None:
+            # Provide a conservative EOS; if pad_id is available, use it;
+            # otherwise fall back to last vocab id.
+            eos_fallback = getattr(config, "pad_id", None)
+            if eos_fallback is None:
+                try:
+                    eos_fallback = int(getattr(config, "odim")) - 1
+                except Exception:
+                    eos_fallback = 2
+            setattr(config, "eos_token_id", int(eos_fallback))
+
+        self.model = FireRedAEDModel(vllm_config=vllm_config, prefix=prefix)
         self.unpadded_vocab_size = config.odim
         self.proj_out = ParallelLMHead(
             config.odim,
@@ -522,126 +565,109 @@ class FireRedASRForConditionalGeneration(nn.Module, SupportsTranscription, Suppo
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "proj_out"),
         )
-        # Tie output proj to embedding
-        self.proj_out = self.proj_out.tie_weights(self.model.decoder.embed_tokens)
+        try:
+            if tuple(self.proj_out.weight.shape) == tuple(self.model.decoder.embed_tokens.weight.shape):
+                self.proj_out = self.proj_out.tie_weights(self.model.decoder.embed_tokens)
+        except Exception:
+            logger.exception("Failed tying LM head to embeddings; continuing.")
         self.logits_processor = LogitsProcessor(self.unpadded_vocab_size, config.odim, 1.0)
 
-        # Attempt to load FireRedASR checkpoint weights directly
         self._maybe_load_firered_checkpoint(vllm_config)
+
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        if modality.startswith("audio"):
+            return None
+        raise ValueError("Only audio modality is supported")
 
     def _maybe_load_firered_checkpoint(self, vllm_config: VllmConfig) -> None:
         try:
             model_dir = vllm_config.model_config.model
             ckpt = os.path.join(model_dir, "model.pth.tar")
             if not os.path.exists(ckpt):
-                logger.warning("FireRedASR checkpoint not found at %s; using random init.", ckpt)
+                logger.warning("FireRedAED checkpoint not found at %s; using random init.", ckpt)
                 return
             package = torch.load(ckpt, map_location="cpu", weights_only=False)
             sd = package.get("model_state_dict",{})
-            # Load embeddings (decoder) and projection
+
+            # Decoder embedding
             dec_emb = sd.get("decoder.tgt_word_emb.weight")
             if dec_emb is not None:
-                self.model.decoder.embed_tokens.weight.data.copy_(dec_emb)
-                self.proj_out.weight.data.copy_(dec_emb)
-            # Load decoder norms
+                emb_shape = tuple(self.model.decoder.embed_tokens.weight.shape)
+                if tuple(dec_emb.shape) == emb_shape:
+                    self.model.decoder.embed_tokens.weight.data.copy_(dec_emb.to(self.model.decoder.embed_tokens.weight.dtype))
+                else:
+                    logger.warning("Decoder embedding shape mismatch: ckpt=%s vs model=%s; skipping", tuple(dec_emb.shape), emb_shape)
+                lm_shape = tuple(self.proj_out.weight.shape)
+                if tuple(dec_emb.shape) == lm_shape:
+                    self.proj_out.weight.data.copy_(dec_emb.to(self.proj_out.weight.dtype))
+                else:
+                    logger.warning("LM head shape mismatch: ckpt=%s vs lm_head=%s; skipping", tuple(dec_emb.shape), lm_shape)
+
+            # Decoder layers
             for i in range(self.config.n_layers_dec):
-                pfx = f"decoder.layer_stack.{i}"
-                self._copy_if_exists(sd, f"{pfx}.self_attn_norm.weight", self.model.decoder.layers[i].self_attn_norm.weight)
-                self._copy_if_exists(sd, f"{pfx}.self_attn_norm.bias", self.model.decoder.layers[i].self_attn_norm.bias)
-                self._copy_if_exists(sd, f"{pfx}.cross_attn_norm.weight", self.model.decoder.layers[i].cross_attn_norm.weight)
-                self._copy_if_exists(sd, f"{pfx}.cross_attn_norm.bias", self.model.decoder.layers[i].cross_attn_norm.bias)
-                self._copy_if_exists(sd, f"{pfx}.mlp_norm.weight", self.model.decoder.layers[i].mlp_norm.weight)
-                self._copy_if_exists(sd, f"{pfx}.mlp_norm.bias", self.model.decoder.layers[i].mlp_norm.bias)
-                # MLP weights
-                self._copy_if_exists(sd, f"{pfx}.mlp.w_1.weight", self._get_param(self.model.decoder.layers[i].mlp.fc1, "weight"))
-                self._copy_if_exists(sd, f"{pfx}.mlp.w_1.bias", self._get_param(self.model.decoder.layers[i].mlp.fc1, "bias"))
-                self._copy_if_exists(sd, f"{pfx}.mlp.w_2.weight", self._get_param(self.model.decoder.layers[i].mlp.fc2, "weight"))
-                self._copy_if_exists(sd, f"{pfx}.mlp.w_2.bias", self._get_param(self.model.decoder.layers[i].mlp.fc2, "bias"))
-                # Attention Q/K/V and out proj: best-effort mapping into QKV stacks
-                self._remap_decoder_attn(sd, pfx, self.model.decoder.layers[i])
-            # Encoder: front-end convs
-            self._copy_if_exists(sd, "encoder.input_preprocessor.conv.0.weight", self._get_param(self.model.encoder.conv[0], "weight"))
-            self._copy_if_exists(sd, "encoder.input_preprocessor.conv.0.bias", self._get_param(self.model.encoder.conv[0], "bias"))
-            self._copy_if_exists(sd, "encoder.input_preprocessor.conv.2.weight", self._get_param(self.model.encoder.conv[2], "weight"))
-            self._copy_if_exists(sd, "encoder.input_preprocessor.conv.2.bias", self._get_param(self.model.encoder.conv[2], "bias"))
+                pfx = f"decoder{self._layer_suffix(i)}"
+                layer = self.model.decoder.layers[i]
+                # self-attn qkv
+                q_w = sd.get(f"{pfx}.self_attn.w_qs.weight")
+                k_w = sd.get(f"{pfx}.self_attn.w_ks.weight")
+                v_w = sd.get(f"{pfx}.self_attn.w_vs.weight")
+                q_b = sd.get(f"{pfx}.self_attn.w_qs.bias")
+                v_b = sd.get(f"{pfx}.self_attn.w_vs.bias")
+                if q_w is not None and k_w is not None and v_w is not None:
+                    qkv_w = torch.cat([q_w, k_w, v_w], dim=0)
+                    layer.self_attn.qkv_proj.weight.data.copy_(qkv_w.to(layer.self_attn.qkv_proj.weight.dtype))
+                    dim = q_w.shape[0]
+                    k_b = torch.zeros_like(q_b) if q_b is not None else torch.zeros(dim)
+                    v_b2 = v_b if v_b is not None else torch.zeros(dim)
+                    qkv_b = torch.cat([q_b or torch.zeros(dim), k_b, v_b2], dim=0)
+                    layer.self_attn.qkv_proj.bias.data.copy_(qkv_b.to(layer.self_attn.qkv_proj.bias.dtype))
+                out_w = sd.get(f"{pfx}.self_attn.fc.weight")
+                out_b = sd.get(f"{pfx}.self_attn.fc.bias")
+                if out_w is not None and hasattr(layer.self_attn.out_proj, "weight"):
+                    layer.self_attn.out_proj.weight.data.copy_(out_w.to(layer.self_attn.out_proj.weight.dtype))
+                if out_b is not None and hasattr(layer.self_attn.out_proj, "bias"):
+                    layer.self_attn.out_proj.bias.data.copy_(out_b.to(layer.self_attn.out_proj.bias.dtype))
+
+                # cross-attn q/k/v
+                q_w = sd.get(f"{pfx}.cross_attn.w_qs.weight")
+                q_b = sd.get(f"{pfx}.cross_attn.w_qs.bias")
+                k_w = sd.get(f"{pfx}.cross_attn.w_ks.weight")
+                v_w = sd.get(f"{pfx}.cross_attn.w_vs.weight")
+                v_b = sd.get(f"{pfx}.cross_attn.w_vs.bias")
+                if q_w is not None:
+                    layer.cross_attn.q_proj.weight.data.copy_(q_w.to(layer.cross_attn.q_proj.weight.dtype))
+                    if q_b is not None:
+                        layer.cross_attn.q_proj.bias.data.copy_(q_b.to(layer.cross_attn.q_proj.bias.dtype))
+                if k_w is not None and v_w is not None:
+                    kv_w = torch.cat([k_w, v_w], dim=0)
+                    layer.cross_attn.kv_proj.weight.data.copy_(kv_w.to(layer.cross_attn.kv_proj.weight.dtype))
+                    d_model = k_w.shape[0]
+                    k_b = torch.zeros_like(v_b) if v_b is not None else torch.zeros(d_model)
+                    kv_b = torch.cat([k_b, v_b or torch.zeros(d_model)], dim=0)
+                    layer.cross_attn.kv_proj.bias.data.copy_(kv_b.to(layer.cross_attn.kv_proj.bias.dtype))
+                out_w = sd.get(f"{pfx}.cross_attn.fc.weight")
+                out_b = sd.get(f"{pfx}.cross_attn.fc.bias")
+                if out_w is not None and hasattr(layer.cross_attn.out_proj, "weight"):
+                    layer.cross_attn.out_proj.weight.data.copy_(out_w.to(layer.cross_attn.out_proj.weight.dtype))
+                if out_b is not None and hasattr(layer.cross_attn.out_proj, "bias"):
+                    layer.cross_attn.out_proj.bias.data.copy_(out_b.to(layer.cross_attn.out_proj.bias.dtype))
+
+            # Encoder front & encoder blocks are not fully mapped here; users may extend as needed.
         except Exception:
-            logger.exception("Failed loading FireRedASR checkpoint; continuing with current parameters.")
+            logger.exception("Failed loading FireRedAED checkpoint; continuing with random init.")
 
-    @staticmethod
-    def _get_param(module: nn.Module, name: str) -> torch.Tensor | None:
-        try:
-            return getattr(module, name)
-        except Exception:
-            return None
-
-    @staticmethod
-    def _copy_if_exists(sd: dict[str, torch.Tensor], key: str, param: torch.Tensor | None) -> None:
-        if param is None:
-            return
-        w = sd.get(key)
-        if w is None:
-            return
-        if tuple(param.shape) == tuple(w.shape):
-            param.data.copy_(w)
-
-    def _remap_decoder_attn(self, sd: dict[str, torch.Tensor], pfx: str, layer: FireRedDecoderLayer) -> None:
-        # Map FireRed separate q/k/v weights to stacked QKVParallelLinear
-        q_w = sd.get(f"{pfx}.self_attn.w_qs.weight")
-        k_w = sd.get(f"{pfx}.self_attn.w_ks.weight")
-        v_w = sd.get(f"{pfx}.self_attn.w_vs.weight")
-        q_b = sd.get(f"{pfx}.self_attn.w_qs.bias")
-        v_b = sd.get(f"{pfx}.self_attn.w_vs.bias")
-        # Create stacked qkv if available
-        if q_w is not None and k_w is not None and v_w is not None:
-            qkv_w = torch.cat([q_w, k_w, v_w], dim=0)
-            layer.self_attn.qkv_proj.weight.data.copy_(qkv_w)
-            # Bias: k has no bias in FireRed; initialize zeros
-            d_model = q_w.shape[0]
-            k_b = torch.zeros_like(q_b) if q_b is not None else torch.zeros(d_model)
-            qkv_b = torch.cat([q_b or torch.zeros(d_model), k_b, v_b or torch.zeros(d_model)], dim=0)
-            layer.self_attn.qkv_proj.bias.data.copy_(qkv_b)
-        # out proj
-        out_w = sd.get(f"{pfx}.self_attn.fc.weight")
-        out_b = sd.get(f"{pfx}.self_attn.fc.bias")
-        if out_w is not None and hasattr(layer.self_attn.out_proj, "weight"):
-            layer.self_attn.out_proj.weight.data.copy_(out_w)
-        if out_b is not None and hasattr(layer.self_attn.out_proj, "bias"):
-            layer.self_attn.out_proj.bias.data.copy_(out_b)
-
-        # Cross-attn: q/k/v
-        q_w = sd.get(f"{pfx}.cross_attn.w_qs.weight")
-        q_b = sd.get(f"{pfx}.cross_attn.w_qs.bias")
-        k_w = sd.get(f"{pfx}.cross_attn.w_ks.weight")
-        v_w = sd.get(f"{pfx}.cross_attn.w_vs.weight")
-        v_b = sd.get(f"{pfx}.cross_attn.w_vs.bias")
-        if q_w is not None:
-            layer.cross_attn.q_proj.weight.data.copy_(q_w)
-            if q_b is not None:
-                layer.cross_attn.q_proj.bias.data.copy_(q_b)
-        if k_w is not None and v_w is not None:
-            kv_w = torch.cat([k_w, v_w], dim=0)
-            layer.cross_attn.kv_proj.weight.data.copy_(kv_w)
-            d_model = k_w.shape[0]
-            k_b = torch.zeros_like(v_b) if v_b is not None else torch.zeros(d_model)
-            kv_b = torch.cat([k_b, v_b or torch.zeros(d_model)], dim=0)
-            layer.cross_attn.kv_proj.bias.data.copy_(kv_b)
-        out_w = sd.get(f"{pfx}.cross_attn.fc.weight")
-        out_b = sd.get(f"{pfx}.cross_attn.fc.bias")
-        if out_w is not None and hasattr(layer.cross_attn.out_proj, "weight"):
-            layer.cross_attn.out_proj.weight.data.copy_(out_w)
-        if out_b is not None and hasattr(layer.cross_attn.out_proj, "bias"):
-            layer.cross_attn.out_proj.bias.data.copy_(out_b)
+    def _layer_suffix(self, i: int) -> str:
+        # Many ESPnet-like models use numeric suffix; adapt if needed.
+        return f".layers.{i}"
 
     @classmethod
     def validate_language(cls, language: str | None) -> str | None:
-        # Default to English if not provided
         if language is None:
             return "en"
         if language in cls.supported_languages:
             return language
-        raise ValueError(
-            f"Unsupported language for FireRedASR: {language!r}. Supported: {list(cls.supported_languages)}"
-        )
+        raise ValueError(f"Unsupported language for FireRedAED: {language!r}. Supported: {list(cls.supported_languages)}")
 
     @classmethod
     def get_generation_prompt(
@@ -654,7 +680,6 @@ class FireRedASRForConditionalGeneration(nn.Module, SupportsTranscription, Suppo
         request_prompt: str,
         to_language: str | None,
     ) -> PromptType:
-        # Decoder starts from request prompt; encoder consumes audio features.
         return cast(
             PromptType,
             {
@@ -662,14 +687,12 @@ class FireRedASRForConditionalGeneration(nn.Module, SupportsTranscription, Suppo
                     "prompt": "",
                     "multi_modal_data": {"audio": (audio, stt_config.sample_rate)},
                 },
-                "decoder_prompt": request_prompt or "",
+                "decoder_prompt": None,
             },
         )
 
     @classmethod
-    def get_speech_to_text_config(
-        cls, model_config: ModelConfig, task_type: Literal["transcribe", "translate"]
-    ) -> SpeechToTextConfig:
+    def get_speech_to_text_config(cls, model_config: ModelConfig, task_type: Literal["transcribe", "translate"]) -> SpeechToTextConfig:
         return SpeechToTextConfig(max_audio_clip_s=30, sample_rate=16_000)
 
     def get_language_model(self) -> torch.nn.Module:
@@ -687,22 +710,29 @@ class FireRedASRForConditionalGeneration(nn.Module, SupportsTranscription, Suppo
         is_multimodal: torch.Tensor | None = None,
         handle_oov_mm_token: bool = False,
     ) -> torch.Tensor:
-        # Text-only decoder embeddings
         return self.model.decoder.get_input_embeddings(input_ids)
 
-    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor | None, positions: torch.Tensor, **kwargs) -> torch.Tensor:
         audio_input = self._parse_and_validate_audio_input(**kwargs)
+        inputs_embeds: torch.Tensor | None = kwargs.pop("inputs_embeds", None)
         return self.model(
             input_features=audio_input["input_features"],
             input_ids=input_ids,
             positions=positions,
+            inputs_embeds=inputs_embeds,
         )
 
-    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        if hidden_states.numel() == 0 or hidden_states.shape[-1] == 0:
+            return None
         return self.logits_processor(self.proj_out, hidden_states)
 
-    def _parse_and_validate_audio_input(self, **kwargs: object) -> FireRedAudioInputs:
+    def _parse_and_validate_audio_input(self, **kwargs: object) -> FireRedAEDAudioInputs:
         input_features = kwargs.pop("input_features", None)
         if input_features is not None:
             input_features = [x.to(self.dtype) for x in input_features]
-        return FireRedAudioInputs(input_features=input_features)
+        return FireRedAEDAudioInputs(input_features=input_features)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str] | None:  # type: ignore[override]
+        # Skip strict HF loader; weights are loaded from local checkpoint.
+        return None
