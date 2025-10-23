@@ -375,6 +375,10 @@ _MULTIMODAL_MODELS = {
     "VoxtralForConditionalGeneration": ("voxtral", "VoxtralForConditionalGeneration"),  # noqa: E501
     # [Encoder-decoder]
     "WhisperForConditionalGeneration": ("whisper", "WhisperForConditionalGeneration"),  # noqa: E501
+    "FireRedASRLLMForConditionalGeneration": (
+        "fireredasr_llm",
+        "FireRedASRLLMForConditionalGeneration",
+    ),
 }
 
 _SPECULATIVE_DECODING_MODELS = {
