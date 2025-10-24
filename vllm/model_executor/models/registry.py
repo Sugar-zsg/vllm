@@ -343,6 +343,11 @@ _MULTIMODAL_MODELS = {
         "qwen2_5_vl",
         "Qwen2_5_VLForConditionalGeneration",
     ),
+    # FireRedASR-LLM (custom speech -> LLM adapter)
+    "FireRedASRLLMForConditionalGeneration": (
+        "fireredasr_llm",
+        "FireRedASRLLMForConditionalGeneration",
+    ),
     "Qwen2AudioForConditionalGeneration": (
         "qwen2_audio",
         "Qwen2AudioForConditionalGeneration",
